@@ -1,0 +1,104 @@
+name: Auto Update & Release XrayR
+
+# 触发机制：
+# 1. 每周五早上 4 点自动运行 (避免业务高峰期)
+# 2. 允许你手动点击 "Run workflow" 按钮触发
+on:
+  schedule:
+    - cron: '0 4 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 允许脚本修改代码并发布 Release
+
+jobs:
+  update-and-build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 1. 检出代码 (Checkout Code)
+        uses: actions/checkout@v4
+
+      - name: 2. 安装 Go 环境 (Setup Go)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23' # 使用较新的 Go 版本以获得性能提升
+          check-latest: true
+
+      - name: 3. 核心依赖更新 (Update Dependencies)
+        run: |
+          echo ">>> 开始更新核心依赖..."
+          
+          # 1. 强制更新 xray-core (核心引擎)
+          go get -u github.com/xtls/xray-core@latest
+          
+          # 2. 更新底层加密和网络库 (修复 HTTP/2 等协议漏洞)
+          go get -u golang.org/x/crypto
+          go get -u golang.org/x/net
+          
+          # 3. 整理其他依赖 (移除不需要的，下载缺失的)
+          go mod tidy
+          
+          echo ">>> 依赖更新完成"
+
+      - name: 4. 提交依赖变更 (Commit Changes)
+        id: commit_step
+        run: |
+          # 检查 go.mod 是否有变化
+          if [[ -n $(git status -s go.mod go.sum) ]]; then
+            git config --global user.name 'GitHub Actions'
+            git config --global user.email 'actions@github.com'
+            git add go.mod go.sum
+            git commit -m "chore: auto update xray-core and dependencies"
+            git push
+            echo "changes_detected=true" >> $GITHUB_OUTPUT
+          else
+            echo "changes_detected=false" >> $GITHUB_OUTPUT
+            echo ">>> 依赖没有变化，跳过提交"
+          fi
+
+      - name: 5. 编译 XrayR (Build Binary)
+        # 无论是否有更新，我们都尝试编译一下，以确保当前代码是可用的
+        run: |
+          echo ">>> 开始编译..."
+          
+          # 创建输出目录
+          mkdir -p build_assets
+          
+          # 编译 Linux AMD64 (最常见的 VPS)
+          echo "正在编译 Linux-AMD64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v -ldflags "-s -w" -o build_assets/XrayR-linux-amd64 ./main.go
+          
+          # 编译 Linux ARM64 (适用于甲骨文 ARM、树莓派等)
+          echo "正在编译 Linux-ARM64..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -v -ldflags "-s -w" -o build_assets/XrayR-linux-arm64 ./main.go
+          
+          # 生成文件的哈希值 (用于校验下载文件是否完整)
+          cd build_assets
+          sha256sum * > sha256sums.txt
+          cd ..
+
+      - name: 6. 创建 Release 发布 (Create Release)
+        uses: softprops/action-gh-release@v1
+        if: steps.commit_step.outputs.changes_detected == 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Auto Build ${{ github.run_number }} (Upstream Sync)
+          body: |
+            ## 自动构建报告
+            此版本由 GitHub Actions 自动生成。
+            
+            ### 🛡 安全更新
+            - **Xray-Core**: Latest
+            - **Crypto/Net Libs**: Updated
+            
+            ### 📦 包含架构
+            - `XrayR-linux-amd64`: 适用于 Intel/AMD CPU 的 VPS
+            - `XrayR-linux-arm64`: 适用于 Oracle ARM / Mac M1 Linux 等
+            
+            ⚠️ **注意**: 请下载对应架构的文件，重命名为 `XrayR` 并替换服务器上的旧文件。
+          files: |
+            build_assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
